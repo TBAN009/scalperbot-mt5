@@ -2,14 +2,17 @@
 """
 ScalperBot.py
 
-Improved Python scalper for MT5 (Exness) with:
+Multi-symbol scalper for MT5 (Exness) with:
 - EMA crossover + RSI + MACD entries
-- Daily profit target & daily loss percent stop
-- Max trades per day
-- 5-minute pause after any losing closed deal
-- Dynamic lot sizing using precise pip value from symbol specs
+- Trades a configurable list of symbols (global daily targets & limits)
+- Daily profit target & daily loss percent stop (global)
+- Max trades per day (global)
+- 5-minute pause after any losing closed deal (from any symbol)
+- Dynamic lot sizing using pip value per symbol when available
 - Logging of order placements and closed deals to CSV (trades.csv)
 - Uses MetaTrader5 Python package
+
+Note: Symbol names must match what your broker uses in MT5 Market Watch (e.g., BTCUSD, GOLD, USTEC, US30). If a symbol is missing, the bot will attempt to select it.
 """
 
 import MetaTrader5 as mt5
@@ -24,7 +27,8 @@ import os
 import sys
 
 # ----------------------------- CONFIG ---------------------------------
-SYMBOL = "EURUSD"
+# List of symbols to trade (change these if your broker uses different names)
+SYMBOLS = ["BTCUSD", "GOLD", "USTEC", "US30"]
 TIMEFRAME = mt5.TIMEFRAME_M5
 EMA_FAST = 5
 EMA_SLOW = 20
@@ -33,7 +37,7 @@ MACD_FAST = 12
 MACD_SLOW = 26
 MACD_SIGNAL = 9
 
-TP_PIPS = 10.0
+TP_PIPS = 10.0   # interpretation of "pip" differs by instrument; pip conversion uses symbol info
 SL_PIPS = 20.0
 
 TARGET_DAILY_PROFIT = 25.0
@@ -69,7 +73,8 @@ day_start_balance = None
 trades_today = 0
 pause_until = None
 trading_paused_for_day = False
-last_deal_time = None  # datetime for incremental deal scanning
+last_deal_time = None  # datetime for incremental deal scanning (global)
+symbol_info_cache = {}
 
 # --------------------------- UTIL FUNCTIONS ----------------------------
 
@@ -103,7 +108,10 @@ def get_symbol_info(sym):
         logger.error("Symbol %s not found", sym)
         return None
     if not info.visible:
-        mt5.symbol_select(sym, True)
+        try:
+            mt5.symbol_select(sym, True)
+        except Exception:
+            pass
     return info
 
 
@@ -111,7 +119,7 @@ def get_rates(symbol, timeframe, bars=300):
     utc_from = datetime.now(timezone.utc) - timedelta(days=2)
     rates = mt5.copy_rates_from(symbol, timeframe, utc_from, bars)
     if rates is None or len(rates) == 0:
-        logger.error("copy_rates_from returned empty for %s", symbol)
+        logger.debug("copy_rates_from returned empty for %s", symbol)
         return None
     df = pd.DataFrame(rates)
     df['time'] = pd.to_datetime(df['time'], unit='s')
@@ -139,27 +147,31 @@ def macd(series, fast=12, slow=26, signal=9):
     hist = macd_line - signal_line
     return macd_line, signal_line, hist
 
+
 def pip_price(symbol_info):
     """
     Returns price difference that corresponds to 1 pip (in price units) and pip value per 1 lot (money).
-    Uses SYMBOL trade tick values when available for precise pip value.
+    Uses symbol trade tick values when available for precise pip value. Falls back to sensible defaults.
     """
-    point = symbol_info.point
-    digits = symbol_info.digits
+    point = getattr(symbol_info, 'point', None)
+    digits = getattr(symbol_info, 'digits', None)
+    if point is None or digits is None:
+        # fallback
+        return 0.0001, 10.0
     pip_multiplier = 10 if digits > 3 else 1
     one_pip_in_price = point * pip_multiplier
 
     # try to compute pip value per 1 lot using trade_tick_value/trade_tick_size
     tick_value = getattr(symbol_info, "trade_tick_value", None)
     tick_size = getattr(symbol_info, "trade_tick_size", None)
-    contract_size = getattr(symbol_info, "trade_contract_size", None)
     if tick_value and tick_size and tick_size != 0:
-        value_per_price_unit_per_lot = tick_value / tick_size  # monetary per 1 price unit per 1 lot
+        value_per_price_unit_per_lot = tick_value / tick_size
         pip_value_per_lot = value_per_price_unit_per_lot * one_pip_in_price
         return one_pip_in_price, pip_value_per_lot
-    # fallback: estimate pip value (very rough) for majors: assume $10 per pip per 1 lot
-    fallback_pip_value = 10.0
-    return one_pip_in_price, fallback_pip_value
+    # fallback estimate: for majors assume ~$10 per pip per lot, for others a smaller default
+    fallback = 10.0
+    return one_pip_in_price, fallback
+
 
 def compute_lot(symbol_info, sl_pips):
     if not USE_DYNAMIC_LOT:
@@ -174,16 +186,21 @@ def compute_lot(symbol_info, sl_pips):
         return MIN_LOT
     lot = money_risk / (sl_pips * pip_value_per_lot)
     # normalize to allowed step
-    step = symbol_info.volume_step if symbol_info.volume_step and symbol_info.volume_step > 0 else 0.01
-    minv = symbol_info.volume_min if symbol_info.volume_min and symbol_info.volume_min > 0 else MIN_LOT
-    maxv = symbol_info.volume_max if symbol_info.volume_max and symbol_info.volume_max > 0 else MAX_LOT
-    lot = max(minv, min(maxv, math.floor(lot / step) * step))
+    step = getattr(symbol_info, 'volume_step', 0.01) or 0.01
+    minv = getattr(symbol_info, 'volume_min', MIN_LOT) or MIN_LOT
+    maxv = getattr(symbol_info, 'volume_max', MAX_LOT) or MAX_LOT
+    try:
+        lot = max(minv, min(maxv, math.floor(lot / step) * step))
+    except Exception:
+        lot = minv
     lot = round(lot, 2)
     lot = clamp(lot, MIN_LOT, MAX_LOT)
     return lot
 
+
 def clamp(x, a, b):
     return max(a, min(b, x))
+
 
 def has_active_position_by_magic(symbol, magic):
     pos = mt5.positions_get(symbol=symbol)
@@ -191,35 +208,12 @@ def has_active_position_by_magic(symbol, magic):
         return False
     for p in pos:
         try:
-            if int(p.magic) == magic:
+            if int(getattr(p, 'magic', 0)) == magic:
                 return True
         except Exception:
             continue
     return False
 
-def deals_since(ts, symbol=None):
-    from_time = datetime.fromtimestamp(ts, tz=timezone.utc)
-    to_time = datetime.now(timezone.utc)
-    try:
-        deals = mt5.history_deals_get(from_time, to_time, group=symbol)
-        return deals if deals is not None else []
-    except Exception:
-        return []
-
-def realized_profit_today(symbol, day_start_ts):
-    deals = deals_since(day_start_ts, symbol)
-    total = 0.0
-    for d in deals:
-        try:
-            # d.order -> order ticket, get order to inspect magic
-            order_ticket = int(d.order) if hasattr(d, "order") else None
-            if order_ticket:
-                order = mt5.order_get(ticket=order_ticket)
-                if order and int(getattr(order, "magic", 0)) == MAGIC:
-                    total += float(d.profit)
-        except Exception:
-            continue
-    return float(total)
 
 def append_trade_csv(row):
     is_new = not os.path.exists(TRADES_CSV)
@@ -229,19 +223,20 @@ def append_trade_csv(row):
             writer.writerow(["timestamp","event","ticket","order","symbol","type","volume","price","sl","tp","profit","balance","comment"])
         writer.writerow(row)
 
-def send_market_order(symbol_info, buy, lot, sl_pips, tp_pips):
-    tick = mt5.symbol_info_tick(SYMBOL)
+
+def send_market_order(symbol, symbol_info, buy, lot, sl_pips, tp_pips):
+    tick = mt5.symbol_info_tick(symbol)
     if tick is None:
-        logger.error("No tick for symbol %s", SYMBOL)
+        logger.error("No tick for symbol %s", symbol)
         return False, None
-    price = tick.ask if buy else tick.bid
+    price = float(tick.ask) if buy else float(tick.bid)
     one_pip_price, _ = pip_price(symbol_info)
     sl_price = price - sl_pips * one_pip_price if buy else price + sl_pips * one_pip_price
     tp_price = price + tp_pips * one_pip_price if buy else price - tp_pips * one_pip_price
 
     request = {
         "action": mt5.TRADE_ACTION_DEAL,
-        "symbol": SYMBOL,
+        "symbol": symbol,
         "volume": float(lot),
         "type": mt5.ORDER_TYPE_BUY if buy else mt5.ORDER_TYPE_SELL,
         "price": float(price),
@@ -255,16 +250,15 @@ def send_market_order(symbol_info, buy, lot, sl_pips, tp_pips):
     }
     result = mt5.order_send(request)
     if result is None:
-        logger.error("order_send returned None")
+        logger.error("order_send returned None for %s", symbol)
         return False, None
     if result.retcode != mt5.TRADE_RETCODE_DONE:
-        logger.warning("Order failed retcode=%s comment=%s", result.retcode, result.comment)
-        # still log attempt
-        append_trade_csv([datetime.now(timezone.utc).isoformat(), "order_failed", result.order, getattr(result, "order", ""), SYMBOL, "BUY" if buy else "SELL",
+        logger.warning("Order failed for %s retcode=%s comment=%s", symbol, result.retcode, result.comment)
+        append_trade_csv([datetime.now(timezone.utc).isoformat(), "order_failed", getattr(result, 'order', ''), getattr(result, 'order', ''), symbol, "BUY" if buy else "SELL",
                          lot, price, sl_price, tp_price, None, get_account_info().balance if get_account_info() else None, result.comment])
         return False, result
-    logger.info("Order placed: %s %s lot=%.2f price=%.5f ticket=%s", "BUY" if buy else "SELL", SYMBOL, lot, price, result.order)
-    append_trade_csv([datetime.now(timezone.utc).isoformat(), "order_placed", result.order, getattr(result, "order", ""), SYMBOL, "BUY" if buy else "SELL",
+    logger.info("Order placed: %s %s lot=%.2f price=%.5f ticket=%s", "BUY" if buy else "SELL", symbol, lot, price, result.order)
+    append_trade_csv([datetime.now(timezone.utc).isoformat(), "order_placed", getattr(result, 'order', ''), getattr(result, 'order', ''), symbol, "BUY" if buy else "SELL",
                      lot, price, sl_price, tp_price, None, get_account_info().balance if get_account_info() else None, result.comment])
     return True, result
 
@@ -301,7 +295,7 @@ def get_signal(df):
 # --------------------------- MAIN LOOP --------------------------------
 
 def run():
-    global day_start_time, day_start_balance, trades_today, pause_until, trading_paused_for_day, last_deal_time
+    global day_start_time, day_start_balance, trades_today, pause_until, trading_paused_for_day, last_deal_time, symbol_info_cache
 
     if not mt5_initialize():
         return
@@ -318,12 +312,21 @@ def run():
     trading_paused_for_day = False
     last_deal_time = datetime.now(timezone.utc) - timedelta(minutes=30)
 
-    symbol_info = get_symbol_info(SYMBOL)
-    if symbol_info is None:
+    # prepare symbol info cache
+    active_symbols = []
+    for s in SYMBOLS:
+        info = get_symbol_info(s)
+        if info is None:
+            logger.warning("Symbol %s not available in Market Watch. Skipping.", s)
+            continue
+        symbol_info_cache[s] = info
+        active_symbols.append(s)
+    if not active_symbols:
+        logger.error("No symbols available to trade. Exiting.")
         mt5_shutdown()
         return
 
-    logger.info("Starting ScalperBot on %s (%s). Day start balance=%.2f", SYMBOL, TIMEFRAME, day_start_balance)
+    logger.info("Starting ScalperBot on symbols: %s", ",".join(active_symbols))
     logger.info("Targets: daily_profit=%.2f daily_loss_percent=%.1f%% max_trades=%d", TARGET_DAILY_PROFIT, DAILY_LOSS_PERCENT, MAX_TRADES_PER_DAY)
 
     try:
@@ -340,7 +343,7 @@ def run():
                 trading_paused_for_day = False
                 logger.info("New trading day. day_start_balance=%.2f", day_start_balance)
 
-            # pauses
+            # global pauses
             if trading_paused_for_day:
                 time.sleep(POLL_INTERVAL)
                 continue
@@ -356,10 +359,24 @@ def run():
                 continue
             current_balance = acc_info.balance
 
-            # compute realized profit using order magic and deals
-            realized = realized_profit_today(SYMBOL, day_start_time)
+            # compute realized profit using deals filtered by magic for all active symbols (global realized)
+            realized = 0.0
+            try:
+                deals = mt5.history_deals_get(datetime.fromtimestamp(day_start_time, tz=timezone.utc), datetime.now(timezone.utc))
+                if deals:
+                    for d in deals:
+                        try:
+                            order_ticket = int(d.order) if hasattr(d, 'order') else None
+                            if order_ticket:
+                                order = mt5.order_get(ticket=order_ticket)
+                                if order and int(getattr(order, 'magic', 0)) == MAGIC and getattr(d, 'symbol', '') in active_symbols:
+                                    realized += float(d.profit)
+                        except Exception:
+                            continue
+            except Exception:
+                realized = current_balance - day_start_balance
 
-            # daily loss check
+            # daily loss check (balance-based)
             loss_allowed_balance = day_start_balance * (1.0 - DAILY_LOSS_PERCENT/100.0)
             if current_balance <= loss_allowed_balance:
                 trading_paused_for_day = True
@@ -377,52 +394,67 @@ def run():
                 time.sleep(POLL_INTERVAL)
                 continue
 
-            # check new deals since last_deal_time to detect losing closed deals and to log them
+            # check new deals since last_deal_time for any active symbol to detect losing closed deals and to log them
             try:
-                deals = mt5.history_deals_get(last_deal_time, datetime.now(timezone.utc), group=SYMBOL)
-                if deals:
-                    for d in deals:
-                        # log any deal associated to our orders (matching order.magic)
+                deals_new = mt5.history_deals_get(last_deal_time, datetime.now(timezone.utc))
+                if deals_new:
+                    for d in deals_new:
                         try:
-                            order_ticket = int(d.order) if hasattr(d, "order") else None
+                            sym = getattr(d, 'symbol', '')
+                            order_ticket = int(d.order) if hasattr(d, 'order') else None
                             if order_ticket:
                                 order = mt5.order_get(ticket=order_ticket)
-                                mag = int(getattr(order, "magic", 0)) if order else 0
-                                if mag == MAGIC:
-                                    append_trade_csv([datetime.now(timezone.utc).isoformat(), "deal", d.ticket if hasattr(d, "ticket") else "", d.order, d.symbol, d.type, d.volume, d.price, d.sl, d.tp, d.profit, get_account_info().balance if get_account_info() else None, getattr(d, "comment", "")])
-                                    # if this deal had negative profit and is a closing deal, pause 5 minutes
+                                mag = int(getattr(order, 'magic', 0)) if order else 0
+                                if mag == MAGIC and sym in active_symbols:
+                                    append_trade_csv([datetime.now(timezone.utc).isoformat(), "deal", getattr(d, 'ticket', ''), d.order, sym, d.type, d.volume, d.price, d.sl, d.tp, d.profit, get_account_info().balance if get_account_info() else None, getattr(d, 'comment', '')])
                                     if float(d.profit) < 0:
                                         pause_until = datetime.now(timezone.utc) + timedelta(minutes=5)
-                                        logger.warning("Detected losing deal (profit=%.2f). Pausing until %s", float(d.profit), pause_until.isoformat())
+                                        logger.warning("Detected losing deal on %s (profit=%.2f). Pausing until %s", sym, float(d.profit), pause_until.isoformat())
                         except Exception:
                             continue
                     last_deal_time = datetime.now(timezone.utc)
             except Exception:
                 pass
 
-            df = get_rates(SYMBOL, TIMEFRAME, bars=300)
-            if df is None:
-                time.sleep(POLL_INTERVAL)
-                continue
+            # iterate active symbols and try to open trades (respect global rules)
+            for symbol in active_symbols:
+                # re-check pauses and daily caps between symbols
+                if trading_paused_for_day:
+                    break
+                if pause_until and datetime.now(timezone.utc) < pause_until:
+                    break
+                if trades_today >= MAX_TRADES_PER_DAY:
+                    trading_paused_for_day = True
+                    break
 
-            signal = get_signal(df)
-            if signal == 0:
-                time.sleep(POLL_INTERVAL)
-                continue
+                # skip if EA already has a position on this symbol
+                if has_active_position_by_magic(symbol, MAGIC):
+                    continue
 
-            if has_active_position_by_magic(SYMBOL, MAGIC):
-                time.sleep(POLL_INTERVAL)
-                continue
+                df = get_rates(symbol, TIMEFRAME, bars=300)
+                if df is None:
+                    continue
 
-            lot = compute_lot(symbol_info, SL_PIPS)
-            lot = clamp(lot, MIN_LOT, MAX_LOT)
+                signal = get_signal(df)
+                if signal == 0:
+                    continue
 
-            ok, res = send_market_order(symbol_info, buy=(signal==1), lot=lot, sl_pips=SL_PIPS, tp_pips=TP_PIPS)
-            if ok:
-                trades_today += 1
-                logger.info("Trade executed. trades_today=%d", trades_today)
-            else:
-                logger.warning("Trade not executed. response=%s", res)
+                s_info = symbol_info_cache.get(symbol)
+                if s_info is None:
+                    continue
+
+                lot = compute_lot(s_info, SL_PIPS)
+                lot = clamp(lot, MIN_LOT, MAX_LOT)
+
+                ok, res = send_market_order(symbol, s_info, buy=(signal==1), lot=lot, sl_pips=SL_PIPS, tp_pips=TP_PIPS)
+                if ok:
+                    trades_today += 1
+                    logger.info("Trade executed on %s. trades_today=%d", symbol, trades_today)
+                else:
+                    logger.warning("Trade failed on %s. response=%s", symbol, res)
+
+                # small delay to avoid hammering the broker
+                time.sleep(0.2)
 
             time.sleep(POLL_INTERVAL)
     except KeyboardInterrupt:
