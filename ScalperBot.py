@@ -48,6 +48,8 @@ USE_DYNAMIC_LOT = True
 RISK_PERCENT_PER_TRADE = 2.0
 MIN_LOT = 0.01
 MAX_LOT = 1.0
+SMALL_ACCOUNT_BALANCE = 10.0
+SMALL_ACCOUNT_MAX_LOT = 0.20
 
 SLIPPAGE = 5
 MAGIC = 20261019
@@ -173,9 +175,23 @@ def pip_price(symbol_info):
     return one_pip_in_price, fallback
 
 
+def get_account_max_lot():
+    """Keep lots conservative on very small accounts.
+    Balances at or below $10 use a max of 0.20 lots; larger accounts use the normal MAX_LOT value.
+    """
+    acc = get_account_info()
+    if acc is None:
+        return MAX_LOT
+    balance = float(getattr(acc, 'balance', 0.0) or 0.0)
+    if balance <= SMALL_ACCOUNT_BALANCE:
+        return SMALL_ACCOUNT_MAX_LOT
+    return MAX_LOT
+
+
 def compute_lot(symbol_info, sl_pips):
+    max_lot_cap = get_account_max_lot()
     if not USE_DYNAMIC_LOT:
-        return clamp(MIN_LOT, MIN_LOT, MAX_LOT)
+        return clamp(MIN_LOT, MIN_LOT, max_lot_cap)
     acc = get_account_info()
     if acc is None:
         return MIN_LOT
@@ -188,13 +204,13 @@ def compute_lot(symbol_info, sl_pips):
     # normalize to allowed step
     step = getattr(symbol_info, 'volume_step', 0.01) or 0.01
     minv = getattr(symbol_info, 'volume_min', MIN_LOT) or MIN_LOT
-    maxv = getattr(symbol_info, 'volume_max', MAX_LOT) or MAX_LOT
+    maxv = getattr(symbol_info, 'volume_max', max_lot_cap) or max_lot_cap
     try:
         lot = max(minv, min(maxv, math.floor(lot / step) * step))
     except Exception:
         lot = minv
     lot = round(lot, 2)
-    lot = clamp(lot, MIN_LOT, MAX_LOT)
+    lot = clamp(lot, MIN_LOT, max_lot_cap)
     return lot
 
 
@@ -406,7 +422,7 @@ def run():
                                 order = mt5.order_get(ticket=order_ticket)
                                 mag = int(getattr(order, 'magic', 0)) if order else 0
                                 if mag == MAGIC and sym in active_symbols:
-                                    append_trade_csv([datetime.now(timezone.utc).isoformat(), "deal", getattr(d, 'ticket', ''), d.order, sym, d.type, d.volume, d.price, d.sl, d.tp, d.profit, get_account_info().balance if get_account_info() else None, getattr(d, 'comment', '')])
+                                    append_trade_csv([datetime.now(timezone.utc).isoformat(), "deal", getattr(d, 'ticket', ''), d.order, sym, d.type, d.volume, d.price, d.sl, d.tp, d.profit, get_account_info().balance if get_account_info() else None, "deal"])
                                     if float(d.profit) < 0:
                                         pause_until = datetime.now(timezone.utc) + timedelta(minutes=5)
                                         logger.warning("Detected losing deal on %s (profit=%.2f). Pausing until %s", sym, float(d.profit), pause_until.isoformat())
@@ -444,7 +460,7 @@ def run():
                     continue
 
                 lot = compute_lot(s_info, SL_PIPS)
-                lot = clamp(lot, MIN_LOT, MAX_LOT)
+                lot = clamp(lot, MIN_LOT, get_account_max_lot())
 
                 ok, res = send_market_order(symbol, s_info, buy=(signal==1), lot=lot, sl_pips=SL_PIPS, tp_pips=TP_PIPS)
                 if ok:
@@ -466,3 +482,5 @@ def run():
 
 if __name__ == "__main__":
     run()
+
+"""}]},
