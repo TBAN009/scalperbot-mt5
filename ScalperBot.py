@@ -28,7 +28,7 @@ import sys
 
 # ----------------------------- CONFIG ---------------------------------
 # List of symbols to trade (change these if your broker uses different names)
-SYMBOLS = ["BTCUSD", "GOLD", "USTEC", "US30"]
+SYMBOLS = ["BTCUSDm", "XAUUSDm", "USTECm", "US30m"]
 TIMEFRAME = mt5.TIMEFRAME_M5
 EMA_FAST = 5
 EMA_SLOW = 20
